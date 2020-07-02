@@ -104,6 +104,15 @@ class coursegroups {
                     $this->mtrace('....failed. Group may have been deleted for too long.');
                 }
             }
+            else {
+                try {
+                    $this->resync_group_membership($objectrec->courseid, $objectrec->objectid);
+                } catch (\Exception $e) {
+                    $this->mtrace('Could not sync users to group for course #'.$objectrec->id.'. Reason: '.$e->getMessage());
+                    continue;
+                }
+            }
+
         }
 
         // Process courses without an associated group.
@@ -117,17 +126,26 @@ class coursegroups {
             $params = array_merge($params, $coursesparams);
         }
         $courses = $this->DB->get_recordset_sql($sql, $params, 0, 5);
+
+        // Get app ID.
+        if (!empty($courses)) {
+            $appid = get_config('local_o365', 'moodle_app_id');
+        }
+
         $coursesprocessed = 0;
         foreach ($courses as $course) {
             $coursesprocessed++;
             $createclassteam = false;
-            $ownerid = null;
+            $ownerids = array();
+            $current_members = array();
 
             if (\local_o365\feature\usergroups\utils::course_is_group_feature_enabled($course->id, 'team')) {
                 $teacherids = $this->get_teacher_ids_of_course($course->id);
                 foreach ($teacherids as $teacherid) {
                     if ($ownerid = $this->DB->get_field('local_o365_objects', 'objectid',
                         ['type' => 'user', 'moodleid' => $teacherid])) {
+                        $ownerids[] = $ownerid;
+                        $current_members[$ownerid] = $teacherid; // Need this for the call to resync_group_membership.
                         $createclassteam = true;
                         break;
                     }
@@ -135,28 +153,21 @@ class coursegroups {
             }
 
             if ($createclassteam) {
-                // Create class team directly.
                 try {
-                    $objectrec = $this->create_class_team($course, $ownerid, $groupprefix);
+                    $objectrec = $this->create_class_team($course, $ownerids, $groupprefix);
                 } catch (\Exception $e) {
-                    $this->mtrace('Could not create class team for course #' . $course->id . '. Reason: ' . $e->getMessage());
+                    $this->mtrace('Could not create class team for course #'.$course->id.'. Reason: '.$e->getMessage());
                     continue;
                 }
-            } else {
-                // Create group.
-                try {
-                    $objectrec = $this->create_group($course, $groupprefix);
-                } catch (\Exception $e) {
-                    $this->mtrace('Could not create group for course #'.$course->id.'. Reason: '.$e->getMessage());
-                    continue;
-                }
-            }
 
-            try {
-                $this->resync_group_membership($course->id, $objectrec['objectid'], []);
-            } catch (\Exception $e) {
-                $this->mtrace('Could not sync users to group for course #'.$course->id.'. Reason: '.$e->getMessage());
-                continue;
+                if ($objectrec) {
+                    try {
+                        $this->resync_group_membership($course->id, $objectrec['objectid'], $current_members);
+                    } catch (\Exception $e) {
+                        $this->mtrace('Could not sync users to group for course #'.$course->id.'. Reason: '.$e->getMessage());
+                        continue;
+                    }
+                }
             }
         }
         if (empty($coursesprocessed)) {
@@ -182,11 +193,6 @@ class coursegroups {
         $courses = $this->DB->get_recordset_sql($sql, $params);
         $coursesprocessed = 0;
 
-        // Get app ID.
-        if (!empty($courses)) {
-            $appid = get_config('local_o365', 'moodle_app_id');
-        }
-
         foreach ($courses as $course) {
             if (\local_o365\feature\usergroups\utils::course_is_group_feature_enabled($course->id, 'team')) {
                 $this->mtrace('Attempting to create team for course #' . $course->id . '...');
@@ -199,6 +205,16 @@ class coursegroups {
                     $this->mtrace($errmsg);
                     continue;
                 }
+
+                $teacherids = $this->get_teacher_ids_of_course($course->id);
+                foreach ($teacherids as $teacherid) {
+                    if ($ownerid = $this->DB->get_field('local_o365_objects', 'objectid',
+                        ['type' => 'user', 'moodleid' => $teacherid])) {
+                        $ownerids[] = $ownerid;
+                        $createclassteam = true;
+                    }
+                }
+
                 try {
                     $this->create_team($course->id, $groupobjectrec->objectid, $appid);
                 } catch (\Exception $e) {
@@ -272,7 +288,7 @@ class coursegroups {
             $response = $this->graphclient->create_group($groupname, $groupshortname, $extra);
         } catch (\Exception $e) {
             $this->mtrace('Could not create group for course #'.$course->id.'. Reason: '.$e->getMessage());
-            return false;
+            throw $e;
         }
 
         $this->mtrace('Created group '.$response['id'].' for course #'.$course->id);
@@ -298,7 +314,7 @@ class coursegroups {
      * @param string|null $groupprefix
      * @return array|bool
      */
-    public function create_class_team($course, $ownerid, $groupprefix = null) {
+    public function create_class_team($course, $ownerids, $groupprefix = null) {
         $now = time();
         $displayname = $course->fullname;
         if (!empty($groupprefix)) {
@@ -309,26 +325,47 @@ class coursegroups {
 
         $extra = null;
 
-        try {
-            $teamid = null;
-            $response = $this->graphclient->create_class_team($displayname, $description, $ownerid, $extra);
-
-            if (is_array($response) && array_key_exists('Location', $response)) {
-                $location = $response['Location'];
-                $locationparts = explode('/', $location);
-                foreach ($locationparts as $locationpart) {
-                    if (substr($locationpart, 0, 5) == 'teams') {
-                        $teamid = substr($locationpart, 7, 36);
-                    }
-                }
+        foreach ($ownerids as $ownerid) {
+            if (($teamid = $this->graphclient->team_exists($displayname, $ownerid))) {
+                break;
             }
-        } catch (\Exception $e) {
-            $this->mtrace('Could not create class team for #' . $course->id . '. Reason: ' . $e->getMessage());
-            return false;
         }
 
-        if (is_null($teamid)) {
-            $this->mtrace('Could not create class team for #' . $course->id . '. Reason: invalid team ID');
+        if (!$teamid) {
+            try {
+                $response = $this->graphclient->create_class_team($displayname, $description, $ownerids, $extra);
+
+                if (is_array($response) && array_key_exists('Location', $response)) {
+                    $location = $response['Location'];
+                    $locationparts = explode('/', $location);
+                    foreach ($locationparts as $locationpart) {
+                        if (substr($locationpart, 0, 5) == 'teams') {
+                            $teamid = substr($locationpart, 7, 36);
+                            $this->mtrace('Created class team ' . $teamid . ' for course #' . $course->id . ' on first attempt.');
+                        }
+                    }
+                }
+                else {
+                    $this->mtrace('Initial attempt: the response is not an array. ' . var_export($response, true));
+                }
+            } catch (\Exception $e) {
+                $this->mtrace('Initial attempt: could not create class team for #' . $course->id . '. Reason: ' . $e->getMessage());
+            }
+        }
+
+        if (!$teamid) {
+            // Sometimes the graph client returns an error, even though the team was created. Let's call team_exists and be doubly sure.
+            foreach ($ownerids as $ownerid) {
+                if (($teamid = $this->graphclient->team_exists($displayname, $ownerid))) {
+                    $this->mtrace('Team creation failed, but there is a team that already exists: ' . $teamid);
+                    $this->mtrace('Inserting previously created team record into DB (' . $teamid . ').');
+                    break;
+                }
+            }
+        }
+
+        if (!$teamid) { // Still nothing? Return false and give up.
+            $this->mtrace('Could not create team (display name: ' . $displayname . ') and this team did not previously exist.');
             return false;
         }
 
@@ -440,6 +477,31 @@ class coursegroups {
     }
 
     /**
+     * Given an array of Microsoft User objects, return an associative
+     * array that looks like arr[<objectid>] = <moodleid>. Return an empty
+     * array if nothing is found.
+     *
+     * @param array $members
+     * @return array
+     */
+
+    public function get_moodleids_for_members($members) {
+        $arr = array();
+
+        $objectids = array_column($members, 'id'); // Just grab IDs from the multi-dimensional array that gets passed.
+
+        list($insql, $inparams) = $this->DB->get_in_or_equal($objectids);
+
+        $sql = "SELECT objectid, moodleid FROM {local_o365_objects} WHERE objectid $insql";
+        if ($results = $this->DB->get_records_sql($sql, $inparams)) {
+            foreach ($results as $row) {
+                $arr[$row->objectid] = $row->moodleid;
+            }
+        }
+        return $arr;
+    }
+
+    /**
      * Resync the membership of a course group based on the users enrolled in the associated course.
      *
      * @param int $courseid The ID of the course.
@@ -468,10 +530,12 @@ class coursegroups {
 
         // Get current group membership (if not already provided).
         if ($currentmembers === null || !is_array($currentmembers)) {
-            $members = $this->graphclient->get_group_members($groupobjectid);
-            $currentmembers = [];
-            foreach ($members['value'] as $member) {
-                $currentmembers[$member['id']] = $member['id'];
+            try {
+                $members = $this->graphclient->get_group_members($groupobjectid);
+                $currentmembers = $this->get_moodleids_for_members($members['value']);
+            }
+            catch (\Exception $e) {
+                // No group members found, let's do nothing and move on with our lives.
             }
         }
 
@@ -587,6 +651,30 @@ class coursegroups {
                         }
                     }
                 }
+            }
+
+            // After multiple retries and the error saying the resource doesn't exist, let's soft delete it in the local_o365_objects table.
+            if ($result !== true && strpos($result, 'Request_ResourceNotFound') !== false) {
+                $this->mtrace("Soft deleting course ID ($courseid) in the local_o365_objects table.");
+
+                if (!isset($objectrec)) {
+                    $params = [
+                        'type' => 'group',
+                        'subtype' => 'course',
+                        'moodleid' => $courseid,
+                    ];
+                    $objectrec = $this->DB->get_record('local_o365_objects', $params);
+                }
+
+                $metadata = (!empty($objectrec->metadata)) ? @json_decode($objectrec->metadata, true) : [];
+                if (empty($metadata) || !is_array($metadata)) {
+                    $metadata = [];
+                }
+                $metadata['softdelete'] = true;
+                $updatedobject = new \stdClass;
+                $updatedobject->id = $objectrec->id;
+                $updatedobject->metadata = json_encode($metadata);
+                $this->DB->update_record('local_o365_objects', $updatedobject);
             }
         }
 
@@ -1071,7 +1159,7 @@ class coursegroups {
         } else {
             // team already exists
             $this->mtrace('Team existed for course #' . $courseid . ' with object table record id ' .
-                $teamobjectrec['id']);
+                $teamobjectrec->id);
             return true;
         }
     }

@@ -560,7 +560,7 @@ class unified extends \local_o365\rest\o365api {
         $data = [
             '@odata.id' => $this->get_apiuri().'/v1.0/directoryObjects/'.$memberobjectid
         ];
-        $response = $this->betaapicall('post', $endpoint, json_encode($data));
+        $response = $this->apicall('post', $endpoint, json_encode($data));
         return ($response === '') ? true : $response;
     }
 
@@ -576,7 +576,7 @@ class unified extends \local_o365\rest\o365api {
         $data = [
             '@odata.id' => $this->get_apiuri().'/v1.0/users/'.$memberobjectid
         ];
-        $response = $this->betaapicall('post', $endpoint, json_encode($data));
+        $response = $this->apicall('post', $endpoint, json_encode($data));
         return ($response === '') ? true : $response;
     }
 
@@ -589,7 +589,7 @@ class unified extends \local_o365\rest\o365api {
      */
     public function remove_member_from_group($groupobjectid, $memberobjectid) {
         $endpoint = '/groups/'.$groupobjectid.'/members/'.$memberobjectid.'/$ref';
-        $response = $this->betaapicall('delete', $endpoint);
+        $response = $this->apicall('delete', $endpoint);
         return ($response === '') ? true : $response;
     }
 
@@ -602,7 +602,7 @@ class unified extends \local_o365\rest\o365api {
      */
     public function remove_owner_from_group($groupobjectid, $memberobjectid) {
         $endpoint = '/groups/'.$groupobjectid.'/owners/'.$memberobjectid.'/$ref';
-        $response = $this->betaapicall('delete', $endpoint);
+        $response = $this->apicall('delete', $endpoint);
         return ($response === '') ? true : $response;
     }
 
@@ -1157,7 +1157,7 @@ class unified extends \local_o365\rest\o365api {
     public function get_application_info() {
         $oidcconfig = get_config('auth_oidc');
         $endpoint = '/applications/?$filter=appId%20eq%20\''.$oidcconfig->clientid.'\'';
-        $response = $this->betaapicall('get', $endpoint);
+        $response = $this->apicall('get', $endpoint);
         $expectedparams = ['value' => null];
         return $this->process_apicall_response($response, $expectedparams);
     }
@@ -1941,7 +1941,11 @@ class unified extends \local_o365\rest\o365api {
         if ($this->httpclient->info['http_code'] == 202) {
             // If response is 202 Accepted, return response.
             return $this->httpclient->response;
-        } else {
+        }
+        else if ($this->httpclient->info['http_code'] == 409) { //A 409 Conflict error means the Team already exists.
+            return $this->httpclient->response;
+        }
+        else {
             // Error.
             throw new \moodle_exception('errorcreatingteamfromgroup', 'local_o365');
         }
@@ -2002,7 +2006,7 @@ class unified extends \local_o365\rest\o365api {
         $generalchannelid = null;
 
         $endpoint = '/teams/' . $groupobjectid . '/channels?$filter=displayName' . rawurlencode(' eq \'General\'');
-        $response = $this->betaapicall('get', $endpoint);
+        $response = $this->apicall('get', $endpoint);
         $expectedparams = ['value' => null];
         $response = $this->process_apicall_response($response, $expectedparams);
         if (count($response['value']) > 0) {
@@ -2057,7 +2061,7 @@ class unified extends \local_o365\rest\o365api {
             'configuration' => $tabconfiguration,
         ];
 
-        $response = $this->betaapicall('post', $endpoint, json_encode($requestparams));
+        $response = $this->apicall('post', $endpoint, json_encode($requestparams));
         $expectedresponse = ['id' => null];
         $response = $this->process_apicall_response($response, $expectedresponse);
 
@@ -2096,5 +2100,40 @@ class unified extends \local_o365\rest\o365api {
         }
 
         return $this->betaapicall('post', '/teams', json_encode($teamdata));
+    }
+
+    /**
+     * Get the Office 365 object ID of the Team with $displayname that
+     * that has members within $userids. Returns the object ID or false if
+     * none were found.
+     *
+     * @param string $displayname
+     * @param array $userids
+     *
+     * @return array|bool
+     */
+    public function team_exists($displayname, $userids) {
+
+        if (is_array($userids)) {
+            foreach ($userids as $userid) {
+                $teams = json_decode($this->apicall('get', '/users/' . $userid . '/joinedTeams'));
+
+                // Loop through the array and see if we find a Team that matches $displayname.
+                foreach ($teams->value as $team) {
+                    if ($team->displayName == $displayname) {
+                        return $team->id;
+                    }
+                }
+            }
+        }
+        else {
+            $teams = json_decode($this->apicall('get', '/users/' . $userids . '/joinedTeams'));
+            foreach ($teams->value as $team) {
+                if ($team->displayName == $displayname) {
+                    return $team->id;
+                }
+            }
+        }
+        return false;
     }
 }
