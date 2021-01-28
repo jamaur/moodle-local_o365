@@ -346,6 +346,11 @@ class coursegroups {
 
         $this->mtrace('Created class team ' . $teamid . ' for course #' . $course->id);
 
+        // A recent bug with the MS Graph API causes the Team to be created as "Public" (even though
+        // we pass "visibility: Private" to the API. The workaround is to set it as private via the
+        // MS Graph "groups" endpoint.
+        $this->graphclient->update_group(array('id' => $teamid, 'visibility' => 'Private'));
+
         // Record group object.
         $groupobjectrec = [
             'type' => 'group',
