@@ -510,10 +510,36 @@ class unified extends \local_o365\rest\o365api {
      * @return array Array of returned members.
      */
     public function get_group_members($groupobjectid) {
-        $endpoint = '/groups/'.$groupobjectid.'/members';
-        $response = $this->apicall('get', $endpoint);
-        $expectedparams = ['value' => null];
-        return $this->process_apicall_response($response, $expectedparams);
+        $nextpage = '';
+        $members = array();
+
+        do {
+
+            if (!empty($nextpage)) {
+                $endpoint = substr($nextpage, strpos($nextpage, '/groups/'));
+            } else {
+                $endpoint = '/groups/'.$groupobjectid.'/members';
+            }
+
+            $response = $this->apicall('get', $endpoint);
+            $expectedparams = ['value' => null];
+
+            $processedresponse = $this->process_apicall_response($response, $expectedparams);
+            $members = array_merge($members, $processedresponse['value']); // Collect all results in this array.
+
+            $nextpage = '';
+
+            if (isset($processedresponse['@odata.nextLink']) && !empty($processedresponse['@odata.nextLink'])) {
+                $nextpage = $processedresponse['@odata.nextLink'];
+            }
+
+        } while (!empty($nextpage));
+
+        if (isset($processedresponse['value'])) {
+            $processedresponse['value'] = $members; // Set the value to the full results (all pages).
+        }
+
+        return $processedresponse;
     }
 
     /**
